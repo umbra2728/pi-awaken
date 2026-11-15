@@ -18,16 +18,22 @@ const TAIL_LINES = 15;
 
 const agentBin = () => join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "bin");
 const cliPath = join(dirname(fileURLToPath(import.meta.url)), "bin", "pi-wake.mjs");
+const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
+function installShim(target: string, content: string) {
+  if (existsSync(target) && readFileSync(target, "utf8") === content) return;
+  writeFileSync(target, content);
+  if (process.platform !== "win32") chmodSync(target, 0o755);
+}
+
 function installCli() {
-  const target = join(agentBin(), "pi-wake");
-  const shim = `#!/bin/sh\nexec "${process.execPath}" "${cliPath}" "$@"\n`;
+  const bin = agentBin();
   try {
-    if (existsSync(target) && readFileSync(target, "utf8") === shim) return;
-    mkdirSync(agentBin(), { recursive: true });
-    writeFileSync(target, shim);
-    chmodSync(target, 0o755);
+    mkdirSync(bin, { recursive: true });
+    // Bash needs the extensionless shim; cmd and PowerShell find the .cmd through PATHEXT.
+    installShim(join(bin, "pi-wake"), `#!/bin/sh\nexec "${process.execPath}" "${cliPath}" "$@"\n`);
+    if (process.platform === "win32") installShim(join(bin, "pi-wake.cmd"), `@echo off\r\n"${process.execPath}" "${cliPath}" %*\r\n`);
   } catch {}
 }
 
@@ -253,7 +259,7 @@ export default function (pi: ExtensionAPI) {
         wakeOn: params.wake_on,
         env: {
           PI_SESSION_ID: s.sessionId,
-          PATH: [agentBin(), process.env.PATH ?? ""].join(delimiter),
+          [pathKey]: [agentBin(), process.env[pathKey] ?? ""].join(delimiter),
         },
       });
       busy.add(job.id);

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -15,7 +15,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import { Job as WinJob, supported as winJobSupported } from "@seydx/win-job";
 
 export type ExitReason = "exit" | "stopped" | "timeout" | "lost";
 export type JobExit = { code: number | null; reason: ExitReason; endedAt: number };
@@ -42,13 +43,38 @@ export type StartOptions = {
 
 export const wakeRoot = () => process.env.PI_WAKE_DIR || join(homedir(), ".pi", "wake");
 
-const RUNNER = 'bash "$1"; c=$?; echo "$c" > "$2.tmp" && mv "$2.tmp" "$2"';
+const isWin = process.platform === "win32";
+const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+
+let cachedShell: string | undefined;
+
+function shellPath(): string {
+  if (cachedShell) return cachedShell;
+  if (!isWin) return (cachedShell = existsSync("/bin/bash") ? "/bin/bash" : "bash");
+  const candidates: string[] = [];
+  for (const base of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs")]) {
+    if (base) candidates.push(join(base, "Git", "bin", "bash.exe"));
+  }
+  const wsl = join(process.env.SystemRoot || "C:\\Windows", "System32", "bash.exe").toLowerCase();
+  for (const dir of (process.env[pathKey] ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, "bash.exe");
+    if (candidate.toLowerCase() !== wsl) candidates.push(candidate);
+  }
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) throw new Error("bash not found on Windows (checked Git install dirs and PATH)");
+  return (cachedShell = found);
+}
+
+const posixPath = (path: string) => (isWin ? path.replaceAll("\\", "/") : path);
+
+const RUNNER = 'exec >> "$3" 2>&1; bash "$1"; c=$?; echo "$c" > "$2.tmp" && mv "$2.tmp" "$2"';
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function isAlive(pid: number): boolean {
   try {
-    process.kill(-pid, 0);
+    process.kill(isWin ? pid : -pid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
@@ -56,6 +82,15 @@ export function isAlive(pid: number): boolean {
 }
 
 function signalGroup(pid: number, signal: NodeJS.Signals) {
+  if (isWin) {
+    try {
+      spawnSync(join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(pid)], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {}
+    return;
+  }
   try {
     process.kill(-pid, signal);
   } catch {}
@@ -83,13 +118,15 @@ export function defaultName(command: string): string {
 }
 
 export class JobStore {
+  readonly sessionId: string;
+  readonly root: string;
   readonly jobsDir: string;
   readonly inboxDir: string;
+  private handles = new Map<string, WinJob>();
 
-  constructor(
-    readonly sessionId: string,
-    readonly root = wakeRoot(),
-  ) {
+  constructor(sessionId: string, root = wakeRoot()) {
+    this.sessionId = sessionId;
+    this.root = root;
     this.jobsDir = join(root, sessionId, "jobs");
     this.inboxDir = join(root, sessionId, "inbox");
   }
@@ -116,26 +153,45 @@ export class JobStore {
     if (!existsSync(options.cwd) || !statSync(options.cwd).isDirectory()) {
       throw new Error(`Working directory does not exist: ${options.cwd}`);
     }
+    const shell = shellPath();
     this.ensure();
     const last = this.ids().pop();
     const id = `j${last ? Number(last.slice(1)) + 1 : 1}`;
     writeFileSync(this.path(id, "sh"), options.command);
-    const fd = openSync(this.path(id, "log"), "a");
-    let pid: number | undefined;
-    try {
-      const child = spawn("/bin/bash", ["-c", RUNNER, "pi-wake", this.path(id, "sh"), this.path(id, "exit")], {
+    const child = spawn(
+      shell,
+      [
+        "-c",
+        RUNNER,
+        "pi-wake",
+        posixPath(this.path(id, "sh")),
+        posixPath(this.path(id, "exit")),
+        posixPath(this.path(id, "log")),
+      ],
+      {
         cwd: options.cwd,
         detached: true,
-        stdio: ["ignore", fd, fd],
+        windowsHide: true,
+        stdio: "ignore",
         env: { ...process.env, ...options.env, PI_WAKE_JOB_ID: id },
-      });
-      child.on("error", () => {});
-      child.unref();
-      pid = child.pid;
-    } finally {
-      closeSync(fd);
+      },
+    );
+    child.on("error", () => {});
+    child.unref();
+    const pid = child.pid;
+    if (!pid) throw new Error(`Failed to spawn ${shell}`);
+    // Windows job object captures the whole process tree (including cross-runtime children).
+    // killOnClose:false keeps the job alive after this process exits, so jobs still survive /reload and restarts.
+    if (isWin && winJobSupported) {
+      this.reapFinishedHandles();
+      try {
+        const handle = new WinJob({ killOnClose: false });
+        handle.assign(pid);
+        this.handles.set(id, handle);
+      } catch {
+        // Assign failing means the handle was never created; fall back to group signals on stop.
+      }
     }
-    if (!pid) throw new Error("Failed to spawn bash");
     const meta: JobMeta = {
       id,
       name: options.name?.trim() || defaultName(options.command),
@@ -181,10 +237,31 @@ export class JobStore {
     writeAtomic(this.path(id, "exit"), JSON.stringify(exit));
   }
 
+  private reapFinishedHandles() {
+    for (const [id, handle] of this.handles) {
+      if (this.get(id)?.exit) {
+        try {
+          handle.close();
+        } catch {}
+        this.handles.delete(id);
+      }
+    }
+  }
+
   async stop(id: string, reason: ExitReason = "stopped", graceMs = 3000): Promise<Job> {
     const job = this.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
     if (job.exit) return job;
+    const handle = this.handles.get(id);
+    if (handle) {
+      try {
+        handle.terminate();
+        handle.close();
+      } catch {}
+      this.handles.delete(id);
+      this.finish(id, reason);
+      return this.get(id)!;
+    }
     signalGroup(job.pid, "SIGTERM");
     const deadline = Date.now() + graceMs;
     while (isAlive(job.pid) && Date.now() < deadline) await sleep(100);

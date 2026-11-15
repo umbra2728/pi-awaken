@@ -32,12 +32,15 @@
     ]
   },
   "scripts": {
-    "test": "node --experimental-transform-types --no-warnings --test store.test.ts",
+    "test": "node --no-warnings --test store.test.ts",
     "typecheck": "tsc -p ."
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@seydx/win-job": "^0.1.0"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^1.1.0",
